@@ -23,6 +23,7 @@ import yaml
 import tt_train_metrics
 import analyze_memory
 import analyze_steps
+import plot_training_comparison
 from model_tracer.generic_ops_tracer import get_machine_info
 
 
@@ -306,6 +307,12 @@ def main() -> int:
         tt_train_metrics.write_json(pydantic_data, output_filename)
 
         set_model_status(filename=model_filename, status="✅", elapsed_time=elapsed_time, log_path=str(log_path))
+
+        # Generate plots
+        plot_dir = output_dir / "plots" / model_filename
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Plot directory: {plot_dir}")
+        plot_training_comparison.main(["--baseline", str(log_path), "--output-dir", str(plot_dir)])
 
     # Show summary and display to Github if environment variable exists
     df = pd.DataFrame(model_status)

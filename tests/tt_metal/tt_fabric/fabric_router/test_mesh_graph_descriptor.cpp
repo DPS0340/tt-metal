@@ -1349,7 +1349,7 @@ TEST(MeshGraphDescriptorTests, ParsesSwitchDescriptor) {
         switch_descriptors: {
           name: "SW0"
           arch: WORMHOLE_B0
-          device_topology: { dims: [ 2, 4 ] }
+          device_topology: { dims: [ 2, 4 ] dim_types: [ RING, RING ] }
           channels: { count: 2 }
         }
 
@@ -1368,7 +1368,10 @@ TEST(MeshGraphDescriptorTests, ParsesSwitchDescriptor) {
         top_level_instance: { graph: { graph_descriptor: "G0" graph_id: 0 } }
     )proto";
 
-    EXPECT_NO_THROW(MeshGraphDescriptor desc(text_proto));
+    MeshGraphDescriptor desc(text_proto);
+    const auto& switch_instance = desc.get_instance(desc.all_switches().at(0));
+    const auto* switch_desc = std::get<const proto::SwitchDescriptor*>(switch_instance.desc);
+    EXPECT_EQ(MeshGraphDescriptor::infer_fabric_type_from_dim_types(switch_desc), FabricType::TORUS_X);
 }
 
 TEST(MeshGraphDescriptorTests, SwitchInstanceCreation) {

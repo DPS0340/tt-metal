@@ -5,6 +5,7 @@
 #include <tt-metalium/experimental/fabric/mesh_graph.hpp>
 #include "experimental/fabric/routing_table_generator.hpp"
 #include "fabric_host_utils.hpp"
+#include "tt_metal/fabric/detail/fabric_type_utils.hpp"
 #include <tt-metalium/experimental/fabric/topology_mapper_utils.hpp>
 
 #include <enchantum/enchantum.hpp>
@@ -60,9 +61,10 @@ RoutingDirection routing_direction_to_port_direction(const proto::RoutingDirecti
         case proto::RoutingDirection::W: return RoutingDirection::W;
         case proto::RoutingDirection::C: return RoutingDirection::C;
         case proto::RoutingDirection::NONE: return RoutingDirection::NONE;
-        default: TT_THROW(
-            "Invalid routing direction: {}",
-            static_cast<std::underlying_type_t<proto::RoutingDirection>>(routing_direction));
+        default:
+            TT_THROW(
+                "Invalid routing direction: {}",
+                static_cast<std::underlying_type_t<proto::RoutingDirection>>(routing_direction));
     }
 }
 
@@ -400,9 +402,9 @@ void MeshGraph::initialize_from_mgd(
         FabricType effective_fabric_type;
 
         if (fabric_config.has_value()) {
-            FabricType requested_fabric_type = get_fabric_type(*fabric_config, is_ubb_galaxy);
+            FabricType requested_fabric_type = get_fabric_type(*fabric_config, is_ubb_galaxy, mesh_shape);
             // Validate that FabricConfig doesn't try to create connections that don't exist
-            if (requires_more_connectivity(requested_fabric_type, mgd_fabric_type, mesh_shape)) {
+            if (requires_more_connectivity(requested_fabric_type, mgd_fabric_type)) {
                 TT_THROW(
                     "FabricConfig {} requests topology {} which requires more connectivity than MGD provides {}. "
                     "FabricConfig can only restrict topology (e.g., torus→mesh), not create new connections.",
@@ -414,7 +416,6 @@ void MeshGraph::initialize_from_mgd(
         } else {
             effective_fabric_type = mgd_fabric_type;
         }
-
         // Build connectivity using effective_fabric_type
         MeshCoordinateRange mesh_coord_range(mesh_shape);
         uint32_t mesh_size = mesh_shape[0] * mesh_shape[1];
@@ -454,7 +455,8 @@ void MeshGraph::initialize_from_mgd(
         }
 
         // Populate mesh_host_ranks_
-        this->mesh_host_ranks_[*mesh_id] = tt_metal::distributed::MeshContainer<MeshHostRankId>(host_shape, mesh_host_ranks_values);
+        this->mesh_host_ranks_[*mesh_id] =
+            tt_metal::distributed::MeshContainer<MeshHostRankId>(host_shape, mesh_host_ranks_values);
 
         // Populate mesh_to_chip_ids
         std::vector<ChipId> chip_ids(mesh_shape[0] * mesh_shape[1]);
@@ -528,29 +530,13 @@ void MeshGraph::initialize_from_mgd(
             switch_desc->device_topology().dims().at(0), switch_desc->device_topology().dims().at(1));
 
         // Build intra-mesh connectivity based on FabricConfig override (if provided) or MGD's fabric type
-        FabricType mgd_fabric_type;
-        const auto& dim_types = switch_desc->device_topology().dim_types();
-        if (dim_types.size() < 2) {
-            mgd_fabric_type = FabricType::MESH;
-        } else {
-            bool y_is_ring = (dim_types[0] == proto::TorusTopology::RING);
-            bool x_is_ring = (dim_types[1] == proto::TorusTopology::RING);
-            if (y_is_ring && x_is_ring) {
-                mgd_fabric_type = FabricType::TORUS_XY;
-            } else if (y_is_ring) {
-                mgd_fabric_type = FabricType::TORUS_Y;
-            } else if (x_is_ring) {
-                mgd_fabric_type = FabricType::TORUS_X;
-            } else {
-                mgd_fabric_type = FabricType::MESH;
-            }
-        }
+        FabricType mgd_fabric_type = MeshGraphDescriptor::infer_fabric_type_from_dim_types(switch_desc);
         FabricType effective_fabric_type;
 
         if (fabric_config.has_value()) {
-            FabricType requested_fabric_type = get_fabric_type(*fabric_config, is_ubb_galaxy);
+            FabricType requested_fabric_type = get_fabric_type(*fabric_config, is_ubb_galaxy, switch_shape);
             // Validate that FabricConfig doesn't try to create connections that don't exist
-            if (requires_more_connectivity(requested_fabric_type, mgd_fabric_type, switch_shape)) {
+            if (requires_more_connectivity(requested_fabric_type, mgd_fabric_type)) {
                 TT_THROW(
                     "FabricConfig requests topology {} which requires more connectivity than MGD provides {}. "
                     "FabricConfig can only restrict topology (e.g., torus→mesh), not create new connections.",
@@ -561,7 +547,6 @@ void MeshGraph::initialize_from_mgd(
         } else {
             effective_fabric_type = mgd_fabric_type;
         }
-
         // Build connectivity using effective_fabric_type
         MeshCoordinateRange switch_coord_range(switch_shape);
         uint32_t switch_size = switch_shape[0] * switch_shape[1];
@@ -954,6 +939,8 @@ MeshGraph MeshGraph::generate_mesh_graph_of_shape(
                 mesh_shape[1]);
         }
     }
+
+    fabric_type = detail::collapse_torus_axes(fabric_type, mesh_shape);
 
     // Initialize for a single mesh (mesh_id = 0)
     MeshId mesh_id(0);

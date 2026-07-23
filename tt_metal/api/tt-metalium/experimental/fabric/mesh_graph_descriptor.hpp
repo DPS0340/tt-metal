@@ -215,6 +215,7 @@ public:
 
     // Helper to infer FabricType from MGD dim_types
     static FabricType infer_fabric_type_from_dim_types(const proto::MeshDescriptor* mesh_desc);
+    static FabricType infer_fabric_type_from_dim_types(const proto::SwitchDescriptor* switch_desc);
 
     const std::vector<std::pair<AsicPosition, FabricNodeId>>& get_pinnings() const { return pinnings_; }
 

@@ -4,6 +4,7 @@
 
 #include <tt-metalium/experimental/fabric/control_plane.hpp>
 #include "fabric_host_utils.hpp"
+#include "tt_metal/fabric/detail/fabric_type_utils.hpp"
 
 #include <tt-metalium/experimental/fabric/fabric.hpp>
 #include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
@@ -83,7 +84,11 @@ FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, bool is_ub
     }
 }
 
-bool requires_more_connectivity(FabricType requested_type, FabricType available_type, const MeshShape& mesh_shape) {
+FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, bool is_ubb_galaxy, const MeshShape& mesh_shape) {
+    return detail::collapse_torus_axes(get_fabric_type(fabric_config, is_ubb_galaxy), mesh_shape);
+}
+
+bool requires_more_connectivity(FabricType requested_type, FabricType available_type) {
     // Requesting MESH is always valid (can restrict any topology to MESH)
     if (requested_type == FabricType::MESH) {
         return false;
@@ -91,18 +96,7 @@ bool requires_more_connectivity(FabricType requested_type, FabricType available_
 
     // Check if available topology can satisfy the requested topology
     if (available_type == FabricType::MESH) {
-        // Special case: 2-element dimensions make torus wrap-around equivalent to mesh neighbor connections
-        // E.g., in a 2-row mesh, north/south wrap-around just connects to the adjacent row
-        bool has_two_rows = (mesh_shape[0] == 2);
-        bool has_two_cols = (mesh_shape[1] == 2);
-
-        if (has_flag(requested_type, FabricType::TORUS_Y) && !has_two_rows) {
-            return true;
-        }
-        if (has_flag(requested_type, FabricType::TORUS_X) && !has_two_cols) {
-            return true;
-        }
-        return false;
+        return true;
     }
 
     // For non-MESH available types, check if requested features are present

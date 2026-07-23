@@ -37,11 +37,11 @@ class FabricNodeId;
 bool is_tt_fabric_config(tt::tt_fabric::FabricConfig fabric_config);
 
 FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, bool is_ubb_galaxy);
+FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, bool is_ubb_galaxy, const MeshShape& mesh_shape);
 
 // Helper to validate that requested FabricType doesn't require more connectivity than available FabricType provides
 // Returns true if requested_type requires more connections than available_type provides
-// mesh_shape: [rows, cols] - used to detect edge cases where 2-row/2-col torus is equivalent to mesh
-bool requires_more_connectivity(FabricType requested_type, FabricType available_type, const MeshShape& mesh_shape);
+bool requires_more_connectivity(FabricType requested_type, FabricType available_type);
 
 // Compute maximum 1D hops across all meshes in topology
 // Returns max(rows-1, cols-1) across all meshes, representing longest linear path
@@ -67,8 +67,8 @@ struct IntraMeshAdjacencyMap {
                                   // closest to chip 0 by default
     std::vector<ChipId> edges;  // Should always be size 2 for 1D meshes, 4 for 2D meshes, populated in order of closest
                                 // to chip 0 by default
-    std::uint32_t ns_size{};         // North-South size (rows)
-    std::uint32_t ew_size{};         // East-West size (columns)
+    std::uint32_t ns_size{};    // North-South size (rows)
+    std::uint32_t ew_size{};    // East-West size (columns)
 };
 
 // Serialize chip IDs to mesh coordinates mapping to a YAML file

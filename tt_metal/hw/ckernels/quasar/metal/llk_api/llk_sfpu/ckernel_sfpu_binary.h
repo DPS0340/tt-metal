@@ -62,6 +62,7 @@ template <
     [[maybe_unused]] bool APPROXIMATION_MODE,
     BinaryOp BINOP,
     bool is_fp32_dest_acc_en = false,
+    bool ROUND_NEAREST = false,
     int ITERATIONS = SFPU_ITERATIONS>
 inline void calculate_sfpu_binary(
     const std::uint32_t dst_index_in0, const std::uint32_t dst_index_in1, const std::uint32_t dst_index_out) {
@@ -97,7 +98,7 @@ inline void calculate_sfpu_binary(
             v_elseif(in0 == in1) { result = 1.0f; }
             v_endif;
 
-            if constexpr (!is_fp32_dest_acc_en) {
+            if constexpr (ROUND_NEAREST && !is_fp32_dest_acc_en) {
                 // Software RNE conversion to match FPU bf16 rounding (Quasar SFPSTORE
                 // truncates by default).
                 result = float32_to_bf16_rne(result);

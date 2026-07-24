@@ -521,7 +521,8 @@ ttnn::Tensor launch_indexer_score(
     std::vector<uint32_t> seq_shard_axes,
     bool allow_subshard,
     std::optional<uint32_t> block_cyclic_sp_axis,
-    std::optional<uint32_t> block_cyclic_chunk_local) {
+    std::optional<uint32_t> block_cyclic_chunk_local,
+    bool block_cyclic_tp_sharded = false) {  // MSA frontend never TP-shards; DSA passes it through
     // Decompose the seq-shard axes into the SP/TP roles the validation + causal geometry below reason about.
     const auto [cluster_axis, seq_subshard_axis] = split_seq_shard_axes(seq_shard_axes, allow_subshard);
     using OperationType = ttnn::operations::experimental::indexer_score::IndexerScoreDeviceOperation;
@@ -596,10 +597,25 @@ ttnn::Tensor launch_indexer_score(
                 *seq_subshard_axis,
                 *cluster_axis);
         }
-        // Store {sp, chunk_local} (matching sparse_sdpa's BlockCyclicLayout); the factory derives the global
-        // chunk (sp*chunk_local) and the invP tile divisors from these.
-        if (sp > 1) {
-            block_cyclic = BlockCyclicLayout{.sp = sp, .chunk_local = chunk_local};
+        // Store {stripes, stripe_chunk} (matching sparse_sdpa's BlockCyclicLayout); the factory derives the
+        // global chunk (stripes*stripe_chunk) and the invP tile divisors from these. GLM-5.2 KV dedup: when
+        // the cache is striped across ALL sp*tp devices (block_cyclic_tp_sharded, gathered TP-inner then
+        // SP-outer into linear chip order), use stripes = sp*tp and stripe_chunk = chunk_local/tp. The global
+        // chunk (stripes*stripe_chunk == sp*chunk_local) is unchanged, so the causal geometry is unaffected;
+        // only the invP KEY remap decodes the finer sp*tp striping.
+        uint32_t stripes = sp;
+        uint32_t stripe_chunk = chunk_local;
+        if (block_cyclic_tp_sharded) {
+            TT_FATAL(
+                chunk_local % tp == 0,
+                "indexer_score: block_cyclic_tp_sharded needs block_cyclic_chunk_local ({}) divisible by tp ({})",
+                chunk_local,
+                tp);
+            stripes = sp * tp;
+            stripe_chunk = chunk_local / tp;
+        }
+        if (stripes > 1) {
+            block_cyclic = BlockCyclicLayout{.sp = stripes, .chunk_local = stripe_chunk};
         }
     }
 
@@ -683,7 +699,8 @@ ttnn::Tensor indexer_score_dsa(
     std::optional<uint32_t> kv_len,
     const std::optional<std::vector<uint32_t>>& seq_shard_axes,
     std::optional<uint32_t> block_cyclic_sp_axis,
-    std::optional<uint32_t> block_cyclic_chunk_local) {
+    std::optional<uint32_t> block_cyclic_chunk_local,
+    bool block_cyclic_tp_sharded) {
     // DSA/GLM: relu, learned per-head gates, one head-summed plane, no pooling. Reads its real weights tensor.
     return launch_indexer_score(
         q,
@@ -702,7 +719,8 @@ ttnn::Tensor indexer_score_dsa(
         seq_shard_axes.value_or(std::vector<uint32_t>{}),
         /*allow_subshard=*/true,
         block_cyclic_sp_axis,
-        block_cyclic_chunk_local);
+        block_cyclic_chunk_local,
+        block_cyclic_tp_sharded);
 }
 
 ttnn::Tensor indexer_score_msa(

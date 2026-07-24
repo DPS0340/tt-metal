@@ -444,8 +444,8 @@ class TtIndexer:
         # GLM-5.2 KV dedup: an SP×TP-sharded index cache holds only 1/tp of each SP row's slab, so
         # reconstruct with a TP-inner gather (concat a row's tp sub-shards) BEFORE the SP-outer gather.
         # The index cache is bfp8 TILE, so this TP all-gather takes the native path (no RM composite
-        # deadlock). Single-chunk only (one block-cyclic slab) — gated by _gather_kvpe_prefix in the
-        # same forward; multi-chunk needs the sp*tp remap in indexer_score_dsa.
+        # deadlock). TP-inner + SP-outer yields the LINEAR chip-major buffer (any slab count), which
+        # indexer_score_dsa decodes with an sp*tp stripe count (block_cyclic_tp_sharded=True).
         if self.tp_shard_kv and self.tp_factor > 1:
             tp_full = self._tp_all_gather(cache_i, dim=2)  # [1,1,T/sp,D_idx] per SP row
             ttnn.deallocate(cache_i)
@@ -642,6 +642,9 @@ class TtIndexer:
             cache_batch_idx=None,  # k_full is already sliced to this slot (batch-1) → no in-kernel select
             block_cyclic_sp_axis=self.sp_axis,
             block_cyclic_chunk_local=seq_len,  # cache slab == chunk_size_global / sp (== Sq'·tp when TP-split)
+            # GLM-5.2 KV dedup: index cache striped over sp*tp (linear chip), gathered TP-inner+SP-outer by
+            # _gather_index_kbuf → indexer_score uses an sp*tp stripe count + seq_len/tp per-stripe chunk.
+            block_cyclic_tp_sharded=False,  # DIAG: temporarily disable to isolate indexer causal-geometry issue
             kv_len=end_pos,
         )
         ttnn.deallocate(k_full)

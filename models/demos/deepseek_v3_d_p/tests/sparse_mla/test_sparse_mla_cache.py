@@ -450,3 +450,131 @@ def test_sparse_tp_sharded_kv_matches_sp(mesh_device, device_params, variant, co
     logger.info(f"[{variant.name}] TP-sharded vs SP-only sparse-MLA output PCC: {pcc}")
     assert passed, f"{variant.name}: TP-dedup output diverged from SP-only: PCC={pcc}"
     ttnn.synchronize_device(mesh_device)
+
+
+# --------------------------------------------------------------------------------------------------
+# Device: GLM-5.2 KV dedup, MULTI-CHUNK. A 2-chunk chunked-prefill run leaves the block-cyclic cache
+# with num_slabs=2, so the TP-inner+SP-outer read reconstruction + the sp*tp block-cyclic remap in
+# sparse_sdpa / indexer_score_dsa (block_cyclic_tp_sharded=True) are exercised for >1 slab. Output must
+# still match the SP-only (TP-replicated) chunked run.
+# --------------------------------------------------------------------------------------------------
+def _run_chunked(mla, mesh_device, rope_tensors, kvpe_cache, index_kv_cache, hidden, chunk):
+    """Chunked sparse prefill: feed one `chunk`-token slice per forward (actual_start advances), gather
+    each chunk's output, and concat. Mirrors test_sparse_mla.py's chunked loop."""
+    shard_dims = [None, None]
+    shard_dims[TP_AXIS], shard_dims[SP_AXIS] = -1, -2
+    seq_len = hidden.shape[1]
+    outs = []
+    for s in range(0, seq_len, chunk):
+        tt_x = ttnn.from_torch(
+            hidden[:, s : s + chunk].unsqueeze(0),
+            device=mesh_device,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=shard_dims),
+        )
+        out = mla.forward(
+            tt_x, rope_tensors, kvpe_cache, actual_start=s, cache_user_id=0, index_kv_cache=index_kv_cache
+        )
+        outs.append(
+            ttnn.to_torch(
+                out, mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=shard_dims, mesh_shape=mesh_device.shape)
+            ).to(torch.bfloat16)
+        )
+    return torch.cat(outs, dim=2)
+
+
+@pytest.mark.parametrize(
+    "mesh_device, device_params",
+    [
+        pytest.param(
+            (2, 4),
+            {
+                "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+                "worker_l1_size": ttnn._ttnn.device.DEFAULT_WORKER_L1_SIZE if is_blackhole() else WH_WORKER_L1_SIZE,
+            },
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(2, 4), topology="mesh-2x4"),
+            id="mesh-2x4",
+        ),
+    ],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["glm_5_1"], indirect=True, ids=["glm_5_1"])
+@pytest.mark.skipif(not is_blackhole(), reason="DSA ops (indexer / sparse SDPA) are Blackhole-only")
+@pytest.mark.timeout(0)
+def test_sparse_tp_sharded_kv_matches_sp_multichunk(mesh_device, device_params, variant, config_only):
+    """MULTI-CHUNK SP×TP-dedup equivalence: a 2-chunk chunked prefill (num_slabs=2) with TP-deduplicated
+    caches must reproduce the SP-only (TP-replicated) output. Exercises the sp*tp block-cyclic remap in
+    sparse_sdpa / indexer_score_dsa for >1 slab (the C++ block_cyclic_tp_sharded path)."""
+    config = config_only
+    CHUNK = 256  # per-chunk global tokens; per-device slab = 256/(sp*tp) = 32 = 1 tile on 2x4
+    MC_SEQ = 512  # two chunks
+    config.max_seq_len = MC_SEQ
+    mesh_shape = list(mesh_device.shape)
+    weights = random_mla_weights(config)
+
+    rope_tensors = RotarySetup(config, mesh_device, sp_axis=SP_AXIS, is_balanced=False).get_rope_tensors_indexed(
+        cache_seq_len_global=MC_SEQ, chunk_size_global=CHUNK
+    )
+    torch.manual_seed(42)
+    hidden = torch.randn(1, MC_SEQ, config.hidden_size, dtype=torch.bfloat16)
+
+    def _kvpe(tp_axis):
+        return init_kvpe_cache(
+            kvpe_cache_head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            mesh_device=mesh_device,
+            seq_len=MC_SEQ,
+            mesh_shape=mesh_shape,
+            sp_axis=SP_AXIS,
+            num_kvpe_cache_layers=1,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            tp_axis=tp_axis,
+        )
+
+    def _index(tp_axis):
+        return init_kvpe_cache(
+            kvpe_cache_head_dim=config.index_head_dim,
+            mesh_device=mesh_device,
+            seq_len=MC_SEQ,
+            mesh_shape=mesh_shape,
+            sp_axis=SP_AXIS,
+            num_kvpe_cache_layers=1,
+            num_users=1,
+            dtype=ttnn.bfloat8_b,
+            tp_axis=tp_axis,
+        )
+
+    mla_sp = ttMLA(
+        config,
+        weights,
+        mesh_device,
+        layer_idx=0,
+        seq_len=MC_SEQ,
+        sp_axis=SP_AXIS,
+        tp_axis=TP_AXIS,
+        is_chunked=True,
+        layer_num=1,
+        tp_shard_kv=False,
+    )
+    out_sp = _run_chunked(mla_sp, mesh_device, rope_tensors, _kvpe(None), _index(None), hidden, CHUNK)
+
+    mla_tp = ttMLA(
+        config,
+        weights,
+        mesh_device,
+        layer_idx=0,
+        seq_len=MC_SEQ,
+        sp_axis=SP_AXIS,
+        tp_axis=TP_AXIS,
+        is_chunked=True,
+        layer_num=1,
+        tp_shard_kv=True,
+    )
+    out_tp = _run_chunked(mla_tp, mesh_device, rope_tensors, _kvpe(TP_AXIS), _index(TP_AXIS), hidden, CHUNK)
+
+    passed, pcc = comp_pcc(out_sp, out_tp, 0.999)
+    logger.info(f"[{variant.name}] MULTI-CHUNK TP-sharded vs SP-only sparse-MLA output PCC: {pcc}")
+    assert passed, f"{variant.name}: multi-chunk TP-dedup diverged from SP-only: PCC={pcc}"
+    ttnn.synchronize_device(mesh_device)

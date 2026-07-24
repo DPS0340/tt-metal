@@ -1465,6 +1465,9 @@ class ttMLA:
             k_chunk_size=k_chunk,
             block_cyclic_sp_axis=self.sp_axis if block_cyclic_chunk_local is not None else None,
             block_cyclic_chunk_local=block_cyclic_chunk_local,
+            # GLM-5.2 KV dedup: cache striped over sp*tp (linear chip), gathered TP-inner+SP-outer by
+            # _gather_kvpe_prefix → sparse_sdpa uses an sp*tp stripe count + chunk_local/tp.
+            block_cyclic_tp_sharded=self.tp_shard_kv and block_cyclic_chunk_local is not None,
             cache_batch_idx=cache_batch_idx,
         )
         ttnn.deallocate(q_rm)
@@ -1515,10 +1518,11 @@ class ttMLA:
         cache_i = ttnn.to_memory_config(kvpe_cache, ttnn.DRAM_MEMORY_CONFIG)  # ND_SHARDED → INTERLEAVED
 
         # GLM-5.2 KV dedup: when the cache is SP×TP-sharded, each device holds only 1/tp of its SP row's
-        # slab, so the per-device slab width is chunk_local/tp and reconstruction needs a TP-inner gather
-        # (concatenate a row's tp sub-shards) BEFORE the SP-outer gather. For a SINGLE block-cyclic slab
-        # that TP concat reproduces exactly the SP-only per-row slab, so the downstream sparse_sdpa remap
-        # (factor sp, chunk_local) is unchanged. Multi-slab would interleave wrong across slabs — gated below.
+        # slab (per-device slab width = chunk_local/tp), so reconstruction needs a TP-inner gather
+        # (concatenate a row's tp sub-shards) BEFORE the SP-outer gather. The TP-inner + SP-outer order
+        # yields the LINEAR chip-major buffer [devL0's slabs | devL1's slabs | ...], L = sp_coord*tp +
+        # tp_coord — each device's slab-major cache contiguous — for ANY slab count. sparse_sdpa then
+        # decodes it with an effective sp*tp stripe count (block_cyclic_tp_sharded=True; chunk = chunk_local/tp).
         tp = self.tp_factor if self.tp_shard_kv else 1
 
         slot_lo = cache_batch_idx if cache_i.shape[0] > 1 else 0  # user-major slot select (single-slot → 0)
@@ -1528,12 +1532,6 @@ class ttMLA:
             # slab is non-uniform across chips and fractional, so trim by slab count, not raw width.
             chunk_size_global = chunk_local * self.sp_factor
             num_slabs = -(-populated_global // chunk_size_global)  # ceil-div
-            if self.tp_shard_kv and self.tp_factor > 1:
-                assert num_slabs == 1, (
-                    "tp_shard_kv read is only wired for single-chunk prefill (one block-cyclic slab); got "
-                    f"{num_slabs} slabs (populated_global={populated_global}, chunk_global={chunk_size_global}). "
-                    "Multi-chunk needs the sp*tp block-cyclic remap in sparse_sdpa (glm52_kv_cache_tp_sharding.md §6.1)."
-                )
             cl_dev = chunk_local // tp  # per-DEVICE slab width (== chunk_local when not TP-sharded)
             seq_hi = min(num_slabs * cl_dev, seq_hi)
 

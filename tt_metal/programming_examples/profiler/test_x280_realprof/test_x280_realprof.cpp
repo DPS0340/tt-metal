@@ -1080,6 +1080,7 @@ int main(int argc, char** argv) {
             }
         };
         auto start = std::chrono::steady_clock::now();  // reset on every drain -> this is a NO-PROGRESS watchdog,
+        uint32_t maxnp = 0;                             // D2H FIFO high-water (pages), for the end-of-run report
         for (;;) {                                      // not a total-runtime cap (long runs at 50k+ markers are fine)
             auto now = std::chrono::steady_clock::now();
             if (now - start > std::chrono::seconds(120)) {
@@ -1091,11 +1092,39 @@ int main(int argc, char** argv) {
                 // bytes_acked). Pages are 16-word aligned, NOT packet-aligned, so prepend the residual partial
                 // packet carried from the last read; the walk below consumes whole packets and re-saves the tail.
                 uint32_t np = nc.socks[h]->pages_available();
+                if (np > maxnp) {
+                    maxnp = np;  // D2H FIFO high-water (pages) -> is the socket buffer the thing filling up?
+                }
                 if (np == 0) {
                     if (device_done.load()) {  // FW idle => sender's final bytes_sent is in; FIFO drained => done
                         break;
                     }
-                    continue;  // spin
+                    // D2H FIFO empty: flusher starved, waiting for the relay to write. Spin inside ONE zone so the
+                    // idle time shows as a single sock-idle span (not a tiny zone per poll). Keep the no-progress
+                    // watchdog live so a wedged device still trips the 120 s cap. If this zone is ~absent while the
+                    // device HOST-WAITs, the flusher is never starved => the D2H FIFO is the bottleneck (staying full).
+                    ZoneScopedNC("sock-idle", 0x7D6608);  // dark yellow
+                    bool giveup = false;
+                    while (np == 0) {
+                        np = nc.socks[h]->pages_available();
+                        if (np != 0) {
+                            break;  // data arrived -> go read it
+                        }
+                        if (device_done.load()) {  // empty AND device idle => fully drained
+                            giveup = true;
+                            break;
+                        }
+                        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(120)) {
+                            giveup = true;
+                            break;
+                        }
+                    }
+                    if (giveup) {
+                        break;
+                    }
+                    if (np > maxnp) {
+                        maxnp = np;
+                    }
                 }
                 // Guard: never request more than the FIFO holds. read() TT_FATALs if num_bytes > fifo_curr_size,
                 // and pages_available() can transiently spike above the FIFO (a bytes_acked-vs-bytes_sent race
@@ -1157,6 +1186,8 @@ int main(int argc, char** argv) {
             // decode buf (whole frames): variable-length walk. SRC/TIMER are 1 word; PROG/markers 2; BULK
             // has its own framing. Advance by the decoded length so packet boundaries stay in sync.
             size_t p = 0, sz = buf.size();
+            ZoneScopedNC("decode", 0x8E44AD);  // purple: flusher decoding pages into Recs (+ mq.push). If this fills
+                                               // the flusher while sock-idle is ~absent, decode+push is the wall.
             while (p < sz) {
                 uint32_t w0 = buf[p];
                 if (pp_is_bulkcore(w0)) {
@@ -1244,6 +1275,16 @@ int main(int argc, char** argv) {
         nc.fl_ts_bad[h] = ts_bad;
         nc.fl_unbal[h] = unbal;
         nc.fl_stall[h] = stall;
+        if (socket_mode) {
+            uint32_t fifo_pages = nc.socks[h]->get_fifo_curr_size() / nc.socks[h]->get_page_size();
+            printf(
+                "  [flusher %llu] D2H FIFO high-water: %u / %u pages (%.0f%% full)  [near 100%% => the socket buffer "
+                "is the back-pressure source, not the MPMC]\n",
+                (unsigned long long)h,
+                maxnp,
+                fifo_pages,
+                fifo_pages ? 100.0 * (double)maxnp / (double)fifo_pages : 0.0);
+        }
         if (ts_bad) {
             printf(
                 "  [flusher %llu DIAG] ts_bad=%llu  on-stall-zone=%llu  ~2^32-jump=%llu\n",

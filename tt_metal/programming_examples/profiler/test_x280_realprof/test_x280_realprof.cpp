@@ -1025,6 +1025,7 @@ int main(int argc, char** argv) {
                                       // aligned, NOT packet-aligned like the raw ring's packet-boundary SENT)
         uint32_t cur_lane = 0xFFFFFFFF;
         auto emit = [&](uint32_t lane, uint32_t w0, uint32_t w1) {
+            ZoneScopedN("MPMC emmit");
             if (lane >= NL) {
                 return;
             }

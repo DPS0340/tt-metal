@@ -80,7 +80,6 @@
   cmd: |
     pytest tests/ttnn/nightly/unit_tests/operations/experimental/test_indexer_score.py -k indexer_score_qb -svv
     pytest tests/ttnn/nightly/unit_tests/operations/experimental/test_ring_indexer_score_dsa.py -svv
-    pytest tests/ttnn/nightly/unit_tests/operations/experimental/test_ring_indexer_score_dsa_4d.py -svv
   skus:
     bh_quietbox_2:
       timeout: 10

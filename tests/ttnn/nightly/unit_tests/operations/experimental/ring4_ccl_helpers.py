@@ -6,8 +6,7 @@
 Not a test module (no `test_` prefix, nothing collected): it holds the fabric/sub-device/semaphore setup and
 the SP-shard / persistent-buffer tensor mappers that `test_ring_indexer_score_dsa.py` reuses, so the ring-4
 recipe lives in exactly one place. Opens a (1, RING) mesh DIRECTLY -- the op is SP=4 (a ring of 4), so it runs
-on 4 devices. (`test_ring_indexer_score_dsa_4d.py` carries the 2D SP×TP variant on a (2, 2) mesh with its own
-opener.)
+on 4 devices. (The 2D SP×TP variant on a (2, 2) mesh lives in the same test file with its own opener.)
 """
 
 import ttnn

@@ -144,11 +144,24 @@
 - name: Galaxy Llama 8B TP=4 DDP=8 train perf tests
   cmd: |
     ./tt-train/scripts/setup_pth.sh
-    python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "llama_8b_tp4_ddp8_shakespeare"
+    # Per-step DRAM trend: alloc climbing => leak; alloc flat but largest contig
+    # free shrinking => fragmentation. Grep the log for "[mem] step".
+    export TT_TRAIN_MEM_TREND=1
+    # for depth in 26 28 30 31 32; do
+    #   echo "===== depth-sweep hang repro: num_blocks=${depth} ====="
+    #   python tt-train/scripts/run_models.py \
+    #     --model_config tt-train/scripts/run_models_configs/galaxy.yaml \
+    #     --filter-filenames "llama_8b_tp4_ddp8_shakespeare" \
+    #     --extra-args "--num_blocks=${depth} --max_steps=128"
+    # done
+    python tt-train/scripts/run_models.py \
+      --model_config tt-train/scripts/run_models_configs/galaxy.yaml \
+      --filter-filenames "llama_8b_tp4_ddp8_shakespeare" \
+      --extra-args "--batch_size=8 --max_steps=300"
   model: llama_8b_tp4_ddp8_shakespeare
   skus:
     bh_galaxy_perf:
-      timeout: 55
+      timeout: 30
   owner_id: U07K00A281X # Kevin Wu
   team: train
   arch: blackhole

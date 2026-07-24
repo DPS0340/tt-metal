@@ -54,6 +54,7 @@ from formatting import HEADER_WIDTH, print_footer, print_header, shorten_home
 from model_builders import FLOPS_REGISTRY, Model, ModelConfig, instantiate_model_from_config, parse_model_config
 from callbacks import (
     AverageLossCallback,
+    DramTrendLogger,
     MemoryTrackerCallback,
     MoECallback,
     ThroughputCallback,
@@ -506,6 +507,17 @@ def run_training(
     if args.track_memory:
         callbacks.append(MemoryTrackerCallback())
 
+    # Opt-in per-step DRAM trend to distinguish a leak (alloc climbs) from
+    # fragmentation (alloc flat, largest contiguous free shrinks). Set
+    # TT_TRAIN_MEM_TREND=1 (or an int log interval).
+    mem_trend = os.environ.get("TT_TRAIN_MEM_TREND")
+    if mem_trend:
+        try:
+            mem_trend_interval = int(mem_trend)
+        except ValueError:
+            mem_trend_interval = 1
+        callbacks.append(DramTrendLogger(log_interval=max(1, mem_trend_interval)))
+
     if training_cfg.use_clip_grad_norm and (device_cfg.enable_tp or device_cfg.enable_fsdp):
         raise ValueError("Clip grad norm is not supported with TP or FSDP")
 
@@ -785,6 +797,8 @@ def main() -> None:
         training_cfg.clip_grad_norm_max_norm = args.max_grad_norm
     if args.sequence_length is not None:
         model_cfg.max_sequence_length = args.sequence_length
+    if args.num_blocks is not None:
+        model_cfg.num_blocks = args.num_blocks
 
     if args.checkpoint_dir:
         os.makedirs(args.checkpoint_dir, exist_ok=True)

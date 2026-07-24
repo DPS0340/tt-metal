@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import ttnn
 import ttml
 from ttml.datasets import Batch
 from ttml.trainers import SFTTrainer, TrainerCallback
@@ -78,6 +79,50 @@ class MemoryTrackerCallback(TrainerCallback):
         MemoryUsageTracker.print_memory_usage()
         MemoryUsageTracker.clear()
         trainer.remove_callback(self)
+
+
+class DramTrendLogger(TrainerCallback):
+    """Per-step DRAM footprint logger to tell a leak apart from fragmentation.
+
+    ``MemoryTrackerCallback`` only snapshots step 1, so it can't show memory
+    marching toward the ceiling over a run. This logs the live per-chip DRAM
+    every ``log_interval`` steps:
+
+      * ``alloc`` climbing monotonically  -> a per-step memory leak (something
+        allocated each step is never freed); the run eventually exhausts DRAM
+        and the ring collective wedges trying to place its scratch buffer.
+      * ``alloc`` flat but ``largest_free`` shrinking -> fragmentation (no net
+        growth, but no contiguous block large enough for the next allocation).
+
+    Reads the host-side allocator view (``ttnn.get_memory_view``); no device
+    sync is issued so this doesn't perturb the timing of the hang we're chasing.
+    Enabled via TT_TRAIN_MEM_TREND (see train.py). Wrapped in try/except so a
+    diagnostic never takes down the run.
+    """
+
+    _GIB = 1024**3
+    _MIB = 1024**2
+
+    def __init__(self, log_interval: int = 1) -> None:
+        self._log_interval = max(1, int(log_interval))
+
+    def on_step_end(self, trainer: SFTTrainer, step: int, *args: Any, **kwargs: Any) -> None:
+        if step % self._log_interval != 0:
+            return
+        try:
+            device = ttml.autograd.AutoContext.get_instance().get_device()
+            v = ttnn.get_memory_view(device, ttnn.BufferType.DRAM)
+            alloc = v.num_banks * v.total_bytes_allocated_per_bank
+            free = v.num_banks * v.total_bytes_free_per_bank
+            largest_free = v.largest_contiguous_bytes_free_per_bank
+            print(
+                f"[mem] step {step}: dram_alloc={alloc / self._GIB:7.3f} GiB "
+                f"dram_free={free / self._GIB:7.3f} GiB "
+                f"largest_contig_free/bank={largest_free / self._MIB:8.1f} MiB",
+                flush=True,
+            )
+        except Exception as e:  # noqa: BLE001 -- diagnostics must never break training
+            print(f"[mem] step {step}: memory view unavailable: {e}", flush=True)
 
 
 class MoECallback(TrainerCallback):

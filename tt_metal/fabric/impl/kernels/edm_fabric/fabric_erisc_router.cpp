@@ -1461,20 +1461,27 @@ template <typename RoutingTableT>
 FORCE_INLINE void run_post_retrain_handshake(
     const RoutingTableT* routing_table_l1, volatile tt::tt_fabric::TerminationSignal* termination_signal_ptr) {
     if constexpr (enable_ethernet_handshake) {
+        // [POST-RETRAIN HANDSHAKE DEBUG] Role-specific markers: ENTER before the spin, DONE only if it
+        // returns. ENTER with no DONE on a core == wedged; the role marker says whether that stuck end was
+        // the sender (master) or receiver (subordinate), so we can classify links straight from the log.
         if constexpr (is_handshake_sender) {
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_SENDER_ENTER);
             erisc::datamover::handshake::fabric_sender_side_handshake<ENABLE_RISC_CPU_DATA_CACHE>(
                 handshake_addr,
                 routing_table_l1->my_mesh_id,
                 routing_table_l1->my_device_id,
                 termination_signal_ptr,
                 DEFAULT_HANDSHAKE_CONTEXT_SWITCH_TIMEOUT);
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_SENDER_DONE);
         } else {
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_RECV_ENTER);
             erisc::datamover::handshake::fabric_receiver_side_handshake<ENABLE_RISC_CPU_DATA_CACHE>(
                 handshake_addr,
                 routing_table_l1->my_mesh_id,
                 routing_table_l1->my_device_id,
                 termination_signal_ptr,
                 DEFAULT_HANDSHAKE_CONTEXT_SWITCH_TIMEOUT);
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_RECV_DONE);
         }
     }
 }
@@ -1483,14 +1490,21 @@ void run_routing_without_noc_sync_coordinated_as_master(
     volatile tt::tt_fabric::TerminationSignal* termination_signal_ptr) {
     if constexpr (IS_RETRAIN_SYNC_MASTER()) {
         coordinated_context_switch_start_as_master(termination_signal_ptr);
+        // [POST-RETRAIN HANDSHAKE] Bracket the recovery pass with a before/after read of the L1 retrain
+        // counter (dev_mem_map MEM_AERISC_RETRAIN_COUNT_BASE). run_routing_without_noc_sync() below runs
+        // recover_eth_link_if_down(), which increments that counter iff a spontaneous retrain just completed
+        // on this core. Comparing before vs after -- rather than tracking a persistent flag -- keeps the
+        // router stateless and is naturally re-entry safe: the handshake's own internal context switches
+        // see the (now-up) link produce no new increment, so they can't recursively trigger another
+        // handshake.
+        const uint32_t retrain_count_before = fabric_get_retrain_count();
         run_routing_without_noc_sync();
-        // [POST-RETRAIN HANDSHAKE] run_routing_without_noc_sync() above ran recover_eth_link_if_down, which
-        // restored config and set post_retrain_hs_pending if a retrain just completed. Do the handshake HERE
+        const uint32_t retrain_count_after = fabric_get_retrain_count();
+        // Count advanced -> a retrain completed this pass. Reconfirm the link is bidirectionally alive HERE
         // -- inside the context switch, while ERISC1 is held idle by the start/finish coordination, and
-        // BEFORE we return to the main loop -- so no traffic resumes over the fresh link until both ends are
-        // confirmed alive. Clear the flag first to prevent re-entry from the handshake's own run_routing().
-        if (post_retrain_hs_pending) {
-            post_retrain_hs_pending = 0;
+        // BEFORE returning to the main loop -- so no traffic resumes over the fresh link until both ends
+        // handshake.
+        if (retrain_count_after != retrain_count_before) {
             const auto* routing_table_l1 =
                 reinterpret_cast<tt_l1_ptr tt::tt_fabric::routing_l1_info_t*>(ROUTING_TABLE_BASE);
             run_post_retrain_handshake(routing_table_l1, termination_signal_ptr);
@@ -3076,6 +3090,11 @@ void kernel_main() {
     // Initialize fabric telemetry early to ensure valid values before router starts
     initialize_fabric_telemetry();
 
+    // [POST-RETRAIN HANDSHAKE] Zero the L1 retrain counter at startup so its absolute value is a meaningful
+    // "retrains so far" count (not reliant on TT_METAL_CLEAR_L1). No-op on ERISC1. Done before any traffic,
+    // so the router's first before/after bracket reads a known baseline.
+    fabric_reset_retrain_count();
+
     eth_txq_reg_write(sender_txq_id, ETH_TXQ_DATA_PACKET_ACCEPT_AHEAD, DEFAULT_NUM_ETH_TXQ_DATA_PACKET_ACCEPT_AHEAD);
     asm volatile("nop");
     static_assert(
@@ -3602,20 +3621,27 @@ void kernel_main() {
         wait_for_other_local_erisc();
     }
     if constexpr (enable_ethernet_handshake) {
+        // [HANDSHAKE DEBUG] Role-specific init/boot markers (distinct codewords from the post-retrain
+        // markers) so a fresh-machine run confirms the handshake path + ring-buffer plumbing work -- for
+        // both sender and receiver roles -- even before any retrain is injected.
         if constexpr (is_handshake_sender) {
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_INIT_SENDER_ENTER);
             erisc::datamover::handshake::fabric_sender_side_handshake<ENABLE_RISC_CPU_DATA_CACHE>(
                 handshake_addr,
                 routing_table_l1->my_mesh_id,
                 routing_table_l1->my_device_id,
                 termination_signal_ptr,
                 DEFAULT_HANDSHAKE_CONTEXT_SWITCH_TIMEOUT);
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_INIT_SENDER_DONE);
         } else {
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_INIT_RECV_ENTER);
             erisc::datamover::handshake::fabric_receiver_side_handshake<ENABLE_RISC_CPU_DATA_CACHE>(
                 handshake_addr,
                 routing_table_l1->my_mesh_id,
                 routing_table_l1->my_device_id,
                 termination_signal_ptr,
                 DEFAULT_HANDSHAKE_CONTEXT_SWITCH_TIMEOUT);
+            fabric_dbg_ringbuf_push_marker(FABRIC_DBG_HANDSHAKE_INIT_RECV_DONE);
         }
 
         // After handshake completes, extract neighbor info and populate telemetry

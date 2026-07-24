@@ -411,13 +411,34 @@ constexpr uint32_t RESUME_PHASE_LOOP_BOTTOM = 0x5E5E0033;        // reached bott
 // volatile so the main loop reliably observes the recovery-set value.
 inline volatile uint32_t was_retrained = 0;
 
-// [POST-RETRAIN HANDSHAKE] Edge-triggered request flag. ERISC0's recovery sets this to 1 on the retrain
-// up-edge, AFTER restoring config (packet mode + ACCEPT_AHEAD). The fabric router main loop (ERISC0) sees
-// it, runs the post-retrain handshake to reconfirm the link is bidirectionally alive (reusing the init
-// handshake on handshake_addr), then clears it back to 0. Lives here (base FW layer) because that's where
-// the retrain is detected; consumed in the kernel layer (fabric_erisc_router.cpp) where the handshake
-// symbols are in scope. volatile: written in the FW recovery path, polled in the kernel main loop.
-inline volatile uint32_t post_retrain_hs_pending = 0;
+// [POST-RETRAIN HANDSHAKE] Retrain notification via a small L1 counter (production behavior -- NOT gated
+// on the watcher/testing path). Stored at MEM_AERISC_RETRAIN_COUNT_BASE (see dev_mem_map.h): one per-core
+// word holding the running number of spontaneous eth retrains ERISC0 has recovered from on this core.
+//   - ERISC0's recovery calls fabric_inc_retrain_count() on each retrain up-edge, AFTER config restore.
+//   - The fabric router (ERISC0), inside its coordinated context switch, reads the counter before and
+//     after each recovery pass; if it advanced, a retrain completed, so it runs the post-retrain handshake
+//     to reconfirm the link is bidirectionally alive before resuming traffic.
+// An L1 word rather than a C++ global: it is real device state -- survives as production behavior, is
+// host-inspectable, and the router observes it through a plain L1 read like any other shared slot.
+// Single writer / single reader, both ERISC0 on this core, so there is no atomicity concern.
+inline uint32_t fabric_get_retrain_count() {
+#if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 0)
+    return *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_RETRAIN_COUNT_BASE);
+#else
+    return 0;
+#endif
+}
+inline void fabric_inc_retrain_count() {
+#if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 0)
+    volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(MEM_AERISC_RETRAIN_COUNT_BASE);
+    *p = *p + 1;
+#endif
+}
+inline void fabric_reset_retrain_count() {
+#if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 0)
+    *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_RETRAIN_COUNT_BASE) = 0;
+#endif
+}
 
 // Number of post-retrain main-loop iterations to allow before the freeze gate stops the loop.
 // was_retrained is 1 on the retrain edge and ++ each iteration bottom, so it takes values 1..N across
@@ -491,6 +512,28 @@ inline void fabric_dbg_ringbuf_push_txrx_counts() {
     WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_TX_TAG | (tx & FABRIC_DBG_RINGBUF_VALUE_MASK));
     WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_RX_TAG | (rx & FABRIC_DBG_RINGBUF_VALUE_MASK));
     WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_CRED_TAG | (cred & FABRIC_DBG_RINGBUF_VALUE_MASK));
+#endif
+}
+
+// [HANDSHAKE DEBUG] Watcher ring-buffer markers for the eth handshake, split by ROLE so a wedged core's
+// ring tells you directly whether it was the sender-side (master) or receiver-side (subordinate) end --
+// no dump_peers pairing needed. ENTER pushed before the spin, DONE right after it returns; ENTER with no
+// matching DONE == wedged (far end never answered). Codeword layout 0x5E5EAA[role][kind] (AA == the
+// handshake MAGIC_HANDSHAKE_VALUE, so they stand out from resume-phase 0x5E5E00xx / pktmode 0x5E5EDAxx):
+//   role nibble: 1 = SENDER (master), 2 = RECEIVER (subordinate)   -> grep "5e5eaa1" vs "5e5eaa2"
+//   kind nibble: 1 = post-retrain ENTER, 2 = post-retrain DONE, 3 = init ENTER, 4 = init DONE
+// Pushed on ERISC0 (the only ERISC that runs either handshake); role is the compile-time is_handshake_sender.
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_SENDER_ENTER = 0x5E5EAA11;       // post-retrain, sender-side spin starting
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_SENDER_DONE = 0x5E5EAA12;        // post-retrain, sender-side returned
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_RECV_ENTER = 0x5E5EAA21;         // post-retrain, receiver-side spin starting
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_RECV_DONE = 0x5E5EAA22;          // post-retrain, receiver-side returned
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_INIT_SENDER_ENTER = 0x5E5EAA13;  // init (boot), sender-side spin starting
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_INIT_SENDER_DONE = 0x5E5EAA14;   // init (boot), sender-side returned
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_INIT_RECV_ENTER = 0x5E5EAA23;    // init (boot), receiver-side spin starting
+constexpr uint32_t FABRIC_DBG_HANDSHAKE_INIT_RECV_DONE = 0x5E5EAA24;     // init (boot), receiver-side returned
+inline void fabric_dbg_ringbuf_push_marker([[maybe_unused]] uint32_t code) {
+#if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 0)
+    WATCHER_RING_BUFFER_PUSH(code);
 #endif
 }
 
@@ -693,8 +736,10 @@ static void recover_eth_link_if_down() {
         // the INIT baseline (PROBE 2) on ALL registers incl. ACCEPT_AHEAD (32/32) if the restore is complete.
         // [TXRX MODE] probe disabled.
         // fabric_dbg_ringbuf_push_pktmode_snapshot(FABRIC_DBG_PKTMODE_CODEWORD_PKTMODE);
-        // [POST-RETRAIN HANDSHAKE] Config is now restored; ask the router main loop to run the handshake.
-        post_retrain_hs_pending = 1;
+        // [POST-RETRAIN HANDSHAKE] Config is now restored; bump the L1 retrain counter. The router's
+        // coordinated context switch brackets this recovery pass with a before/after read of the counter,
+        // sees it advance, and runs the post-retrain handshake before resuming traffic.
+        fabric_inc_retrain_count();
         if (was_retrained == 0) {
             was_retrained = 1;  // edge-triggered freeze/debug flag; one-shot, matches WAS_RETRAINED gate
         }

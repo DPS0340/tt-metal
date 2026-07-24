@@ -78,8 +78,8 @@
   #   * ring-fused op (ring_indexer_score_dsa): the full feature matrix on a (1,4) ring, plus the 2D SP×TP
   #     (2,2) variant. The op is SP=4, so 4 devices suffice.
   cmd: |
-    pytest tests/ttnn/nightly/unit_tests/operations/experimental/test_indexer_score.py -k indexer_score_qb -svv
-    pytest tests/ttnn/nightly/unit_tests/operations/experimental/test_ring_indexer_score_dsa.py -svv
+    pytest tests/ttnn/nightly/unit_tests/operations/experimental/indexer_score/test_indexer_score.py -k indexer_score_qb -svv
+    pytest tests/ttnn/nightly/unit_tests/operations/experimental/indexer_score/test_ring_indexer_score_dsa.py -svv
   skus:
     bh_quietbox_2:
       timeout: 10

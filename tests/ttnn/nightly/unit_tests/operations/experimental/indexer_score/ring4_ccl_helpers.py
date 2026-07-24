@@ -11,7 +11,7 @@ on 4 devices. (The 2D SP×TP variant on a (2, 2) mesh lives in the same test fil
 
 import ttnn
 
-from tests.ttnn.nightly.unit_tests.operations.experimental.test_indexer_score import (
+from tests.ttnn.nightly.unit_tests.operations.experimental.indexer_score.test_indexer_score import (
     QB_HISTORY,
     QB_SQ,
 )

@@ -19,7 +19,7 @@ from loguru import logger
 
 import ttnn
 
-from tests.ttnn.nightly.unit_tests.operations.experimental.test_indexer_score import (
+from tests.ttnn.nightly.unit_tests.operations.experimental.indexer_score.test_indexer_score import (
     assert_indexer_match,
     glx_config,
     indexer_score_dsa_ref,
@@ -35,7 +35,7 @@ from tests.ttnn.nightly.unit_tests.operations.experimental.test_indexer_score im
     ST_CS,
     ST_T,
 )
-from tests.ttnn.nightly.unit_tests.operations.experimental.ring4_ccl_helpers import (
+from tests.ttnn.nightly.unit_tests.operations.experimental.indexer_score.ring4_ccl_helpers import (
     _open_ring4_ccl,
     _close_ring4_ccl,
     _persistent_buffer,

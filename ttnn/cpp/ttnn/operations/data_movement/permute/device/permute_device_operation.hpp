@@ -52,7 +52,7 @@ struct PermuteDeviceOperation {
     // Tiled tensor where both tile dimensions stay in the last two positions
     // (either identity or WH swap).
     struct MultiCoreTileInvariant {
-        static tt::tt_metal::ProgramDescriptor create_descriptor(
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
             const operation_attributes_t& operation_attributes,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value);
@@ -61,7 +61,7 @@ struct PermuteDeviceOperation {
     // Tiled tensor where only one of the tile dimensions is moved out of the
     // last two positions.
     struct MultiCoreTileRowInvariant {
-        static tt::tt_metal::ProgramDescriptor create_descriptor(
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
             const operation_attributes_t& operation_attributes,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value);
@@ -69,7 +69,7 @@ struct PermuteDeviceOperation {
 
     // Tiled tensor where both tile dimensions are moved in the permutation.
     struct MultiCoreTiledGeneric {
-        static tt::tt_metal::ProgramDescriptor create_descriptor(
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
             const operation_attributes_t& operation_attributes,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value);

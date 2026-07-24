@@ -9,11 +9,13 @@ Written during the inventory and planning steps; committed alongside the port fo
 
 | Pass | Factory | File | Kernels | Donor kernels? | Status |
 |---|---|---|---|---|---|
-| 1 | `MultiCoreRowInvariant` | `permute_rm_program_factory.cpp` | reader + writer (own) | no | planned |
-| 1 | `MultiCoreBlockedGeneric` | `permute_rm_program_factory.cpp` | reader + writer + compute (own) | no | planned |
-| 2 | `MultiCoreTiledGeneric` | `permute_tiled_program_factory.cpp` | reader + writer + compute (own) | no | deferred |
-| 3 | `MultiCoreTileInvariant` | `permute_tiled_program_factory.cpp` | reader (own) + writer (donor) + compute (donor, swap-hw) | **yes** | deferred |
-| 3 | `MultiCoreTileRowInvariant` | `permute_tiled_program_factory.cpp` | reader (donor) + writer (own) + compute (donor, swap-hw) | **yes** | deferred |
+| 1 | `MultiCoreRowInvariant` | `permute_rm_program_factory.cpp` | reader + writer (own) | no | **PORTED** |
+| 1 | `MultiCoreBlockedGeneric` | `permute_rm_program_factory.cpp` | reader + writer + compute (own) | no | **PORTED** |
+| 2 | `MultiCoreTiledGeneric` | `permute_tiled_program_factory.cpp` | reader + writer + compute (own) | no | **PORTED** |
+| 3 | `MultiCoreTileInvariant` | `permute_tiled_program_factory.cpp` | reader (own) + writer (donor) + compute (donor, swap-hw) | **yes** | **PORTED** |
+| 3 | `MultiCoreTileRowInvariant` | `permute_tiled_program_factory.cpp` | reader (donor) + writer (own) + compute (donor, swap-hw) | **yes** | **PORTED** |
+
+**All five factories ported** — `permute` is fully on `MetalV2FactoryConcept`.
 
 Rationale: the RM file (pass 1) has two self-contained factories with no donor kernels — the cleanest starting unit and the entire row-major path. `MultiCoreTiledGeneric` (pass 2) is also donor-free. The two remaining tiled factories (pass 3) instantiate three donor kernels by file path (`writer_unary_interleaved_start_id.cpp`, `transpose_wh.cpp`, `reader_unary_transpose_hc_interleaved_tiled_padding_aware.cpp`) and require the shared-kernel fork-vs-in-place decision; grouped last so the donor rewrite is a single coordinated step.
 

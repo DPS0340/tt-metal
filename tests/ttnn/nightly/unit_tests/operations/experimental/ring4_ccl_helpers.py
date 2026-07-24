@@ -32,11 +32,12 @@ _INPUT_DIMS = (None, 2)
 _BUF_DIMS = (1, None)
 
 
-def _open_ring4_ccl(fabric_config=ttnn.FabricConfig.FABRIC_1D):
-    """Open a (1, RING) mesh DIRECTLY (4 devices, no submesh carve) with the requested 1D fabric, load a worker
-    sub-device, make 2 CCL semaphores (the two ring directions ring_attention_all_gather_async needs). Returns
-    (mesh, mesh, ccl_semaphores, worker_sub_device_id, stall_group) -- the mesh is returned twice so the
-    historical `submesh, parent` unpacking in callers keeps working; both names refer to the one open mesh."""
+def _open_ring4_ccl(fabric_config=ttnn.FabricConfig.FABRIC_2D):
+    """Open a (1, RING) mesh DIRECTLY (4 devices, no submesh carve) with the requested fabric (FABRIC_2D by
+    default), load a worker sub-device, make 2 CCL semaphores (the two ring directions
+    ring_attention_all_gather_async needs). Returns (mesh, mesh, ccl_semaphores, worker_sub_device_id,
+    stall_group) -- the mesh is returned twice so the historical `submesh, parent` unpacking in callers keeps
+    working; both names refer to the one open mesh."""
     ttnn.set_fabric_config(
         fabric_config,
         ttnn.FabricReliabilityMode.STRICT_INIT,

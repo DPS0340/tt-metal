@@ -209,7 +209,8 @@ void bind_indexer_score(nb::module_& mod) {
             cluster_axis: mesh axis that is the SP ring -- both the gather axis and the causality axis.
                 REQUIRED here (optional in indexer_score_dsa)
             topology: ttnn.Topology -- ttnn.Topology.Linear (non-torus grid) or ttnn.Topology.Ring
-            num_links: int, fabric links for the gather (default 1)
+            num_links: int, fabric links for the gather (default 2, the production Blackhole link count; only
+                changes fabric routing / bandwidth, never the gathered result)
             ag_sub_device_id: optional ttnn.SubDeviceId scoping the AG worker cores (kept disjoint from the
                 compute grid so transport and compute cores do not collide)
             chunk_start_idx: optional int, rank 0's global query start; see indexer_score_dsa
@@ -237,7 +238,7 @@ void bind_indexer_score(nb::module_& mod) {
         nb::kw_only(),
         nb::arg("cluster_axis"),
         nb::arg("topology"),
-        nb::arg("num_links") = 1,
+        nb::arg("num_links") = 2,
         nb::arg("ag_sub_device_id") = nb::none(),
         nb::arg("chunk_start_idx") = nb::none(),
         nb::arg("program_config") = IndexerScoreProgramConfig{},

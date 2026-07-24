@@ -146,7 +146,7 @@ ttnn::Tensor ring_indexer_score_dsa(
     const std::vector<tt::tt_metal::GlobalSemaphore>& ag_multi_device_global_semaphore,
     uint32_t cluster_axis,
     ttnn::ccl::Topology topology,
-    uint32_t num_links = 1,
+    uint32_t num_links = 2,
     std::optional<tt::tt_metal::SubDeviceId> ag_sub_device_id = std::nullopt,
     std::optional<uint32_t> chunk_start_idx = std::nullopt,
     const ttnn::operations::experimental::indexer_score::IndexerScoreProgramConfig& program_config = {},

@@ -208,6 +208,7 @@ class TtIndexer:
         seq_len: int = 1024,
         slot_num: int = 1,
         layer_num: int = 1,
+        tp_shard_kv: bool = False,
     ):
         """Architecture constants are read from the HF config with no defaults (index_n_heads,
         index_head_dim, index_topk, index_rope_interleave — a sparse config that omits any of them
@@ -226,6 +227,9 @@ class TtIndexer:
         mesh_shape = list(mesh_device.shape)
         self.sp_factor = mesh_shape[sp_axis]
         self.tp_factor = mesh_shape[tp_axis]
+        # GLM-5.2 KV dedup: index key cache sharded across SP×TP (not TP-replicated). Adds a TP-inner
+        # all-gather leg in _gather_index_kbuf and passes tp_axis to the write. Single-chunk path only.
+        self.tp_shard_kv = tp_shard_kv
         self.default_compute_kernel_config = default_compute_kernel_config
         self.hifi4_fp32_compute_kernel_config = hifi4_fp32_compute_kernel_config
         self.weight_cache_path = weight_cache_path
@@ -437,6 +441,15 @@ class TtIndexer:
             )
             ttnn.deallocate(cache_i)
             cache_i = sel
+        # GLM-5.2 KV dedup: an SP×TP-sharded index cache holds only 1/tp of each SP row's slab, so
+        # reconstruct with a TP-inner gather (concat a row's tp sub-shards) BEFORE the SP-outer gather.
+        # The index cache is bfp8 TILE, so this TP all-gather takes the native path (no RM composite
+        # deadlock). Single-chunk only (one block-cyclic slab) — gated by _gather_kvpe_prefix in the
+        # same forward; multi-chunk needs the sp*tp remap in indexer_score_dsa.
+        if self.tp_shard_kv and self.tp_factor > 1:
+            tp_full = self._tp_all_gather(cache_i, dim=2)  # [1,1,T/sp,D_idx] per SP row
+            ttnn.deallocate(cache_i)
+            cache_i = tp_full
         full = self._sp_all_gather(cache_i, dim=2)  # [1,1,T,D_idx] replicated, block-cyclic
         if self.sp_factor > 1:
             ttnn.deallocate(cache_i)
@@ -484,6 +497,7 @@ class TtIndexer:
             num_layers=self._index_cache_layers,
             kv_actual_global=start_pos,
             cluster_axis=self.sp_axis,
+            tp_axis=self.tp_axis if self.tp_shard_kv else None,  # GLM-5.2 KV dedup: write only this chip's 1/tp window
         )
         ttnn.deallocate(k)
 

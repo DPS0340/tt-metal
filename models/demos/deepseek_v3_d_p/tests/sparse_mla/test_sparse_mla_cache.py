@@ -350,3 +350,103 @@ def test_sparse_cache_only_without_cache_warns_stays_sparse(mesh_device, device_
     assert any(
         "indexer has neither host weights nor a complete cache" in m for m in warnings
     ), f"expected a loud warning about the missing indexer weights/cache; got: {warnings}"
+
+
+# --------------------------------------------------------------------------------------------------
+# Device: GLM-5.2 KV dedup (SP×TP-sharded KVPE + index caches) reproduces the SP-only (TP-replicated)
+# sparse output bit-for-bit-close. TP-dedup is pure STORAGE dedup (each chip persists its own 1/tp
+# window instead of a replicated copy) + a TP-inner all-gather on read, so the attention output must
+# match the SP-only path. Single-chunk (SEQ_LEN == one block-cyclic slab) — the wired scope.
+# --------------------------------------------------------------------------------------------------
+def _build_mla_tp(config, state_dict, mesh_device, *, tp_shard_kv):
+    return ttMLA(
+        config,
+        state_dict,
+        mesh_device,
+        layer_idx=0,
+        seq_len=SEQ_LEN,
+        sp_axis=SP_AXIS,
+        tp_axis=TP_AXIS,
+        weight_cache_path=None,
+        layer_num=1,
+        tp_shard_kv=tp_shard_kv,
+    )
+
+
+@pytest.mark.parametrize(
+    "mesh_device, device_params",
+    [
+        pytest.param(
+            (2, 4),
+            {
+                "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+                "worker_l1_size": ttnn._ttnn.device.DEFAULT_WORKER_L1_SIZE if is_blackhole() else WH_WORKER_L1_SIZE,
+            },
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(2, 4), topology="mesh-2x4"),
+            id="mesh-2x4",
+        ),
+    ],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["glm_5_1"], indirect=True, ids=["glm_5_1"])
+@pytest.mark.skipif(not is_blackhole(), reason="DSA ops (indexer / sparse SDPA) are Blackhole-only")
+@pytest.mark.timeout(0)
+def test_sparse_tp_sharded_kv_matches_sp(mesh_device, device_params, variant, config_only):
+    """SP×TP-sharded (deduplicated) KVPE + index caches must reproduce the SP-only sparse MLA output.
+
+    Same weights + input run twice: once with TP-replicated caches (tp_shard_kv=False, today's path) and
+    once with SP×TP-sharded caches (tp_shard_kv=True). The writes deduplicate storage (each chip keeps its
+    own 1/tp seq window) and the reads add a TP-inner all-gather that reconstructs the exact SP-only
+    block-cyclic buffer, so the attention output is identical up to bf16 all-gather reassociation."""
+    config = config_only
+    config.max_seq_len = SEQ_LEN
+    mesh_shape = list(mesh_device.shape)
+    weights = random_mla_weights(config)  # config-shaped random weights suffice for a device-vs-device check
+
+    rope_tensors = RotarySetup(config, mesh_device, sp_axis=SP_AXIS, is_balanced=False).get_rope_tensors_indexed(
+        cache_seq_len_global=SEQ_LEN, chunk_size_global=SEQ_LEN
+    )
+    torch.manual_seed(42)
+    hidden = torch.randn(1, SEQ_LEN, config.hidden_size, dtype=torch.bfloat16)
+
+    # --- SP-only (TP-replicated) reference ---
+    mla_sp = _build_mla_tp(config, weights, mesh_device, tp_shard_kv=False)
+    out_sp = _forward(
+        mla_sp,
+        mesh_device,
+        rope_tensors,
+        _new_kvpe(config, mesh_device, mesh_shape),
+        _new_index_kv(config, mesh_device, mesh_shape),
+        hidden,
+    )
+
+    # --- SP×TP-sharded (deduplicated) ---
+    mla_tp = _build_mla_tp(config, weights, mesh_device, tp_shard_kv=True)
+    kvpe_tp = init_kvpe_cache(
+        kvpe_cache_head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+        mesh_device=mesh_device,
+        seq_len=SEQ_LEN,
+        mesh_shape=mesh_shape,
+        sp_axis=SP_AXIS,
+        num_kvpe_cache_layers=1,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        tp_axis=TP_AXIS,  # dedup across TP
+    )
+    index_tp = init_kvpe_cache(
+        kvpe_cache_head_dim=config.index_head_dim,
+        mesh_device=mesh_device,
+        seq_len=SEQ_LEN,
+        mesh_shape=mesh_shape,
+        sp_axis=SP_AXIS,
+        num_kvpe_cache_layers=1,
+        num_users=1,
+        dtype=ttnn.bfloat8_b,
+        tp_axis=TP_AXIS,  # dedup across TP
+    )
+    out_tp = _forward(mla_tp, mesh_device, rope_tensors, kvpe_tp, index_tp, hidden)
+
+    passed, pcc = comp_pcc(out_sp, out_tp, 0.999)
+    logger.info(f"[{variant.name}] TP-sharded vs SP-only sparse-MLA output PCC: {pcc}")
+    assert passed, f"{variant.name}: TP-dedup output diverged from SP-only: PCC={pcc}"
+    ttnn.synchronize_device(mesh_device)

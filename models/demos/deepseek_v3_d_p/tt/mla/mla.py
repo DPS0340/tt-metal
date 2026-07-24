@@ -263,6 +263,7 @@ class ttMLA:
         layer_num: int = 61,
         kv_only: bool = False,
         has_indexer: bool | None = None,
+        tp_shard_kv: bool = False,
     ):
         # DSA indexer weights (v3.2 / GLM): extract NON-mutating, so the caller's state_dict survives
         # repeated construction / cache build+load (the old pop() emptied it on the first pass). Dense
@@ -277,6 +278,10 @@ class ttMLA:
         self.is_balanced = is_balanced
         self.weight_cache_path = weight_cache_path
         self.is_chunked = is_chunked
+        # GLM-5.2 KV dedup: when True the KVPE (and indexer key) caches are sharded across BOTH the SP
+        # and TP axes (not TP-replicated). Writes pass tp_axis to update_padded_kv_cache and reads add a
+        # TP-inner all-gather leg before the SP gather. Only wired for the SPARSE single-chunk path today.
+        self.tp_shard_kv = tp_shard_kv
         self.slot_num = slot_num
         self.layer_num = layer_num
 
@@ -485,6 +490,7 @@ class ttMLA:
                     seq_len=seq_len,
                     slot_num=slot_num,
                     layer_num=self.layer_num,
+                    tp_shard_kv=self.tp_shard_kv,
                 )
         else:
             self._indexer = NullIndexer()  # dense v3.1: forward calls .forward() -> None (dense path)
@@ -743,6 +749,9 @@ class ttMLA:
 
         # Write this chunk into the cache. update_padded_kv_cache derives each chip's local write
         # offset on-device from kv_actual_global (chunk-aligned kv_actual -> uniform per-chip write).
+        # TP-dedup is only wired for the SPARSE path (_sparse_chunked_attn); the dense ring_mla cache is
+        # still TP-replicated, so fail loud if a dense layer is asked to TP-shard its KV.
+        assert not self.tp_shard_kv, "tp_shard_kv is only supported on the sparse (DSA) path, not dense ring_mla"
         ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
             kvpe_cache,
             tt_kvpe,
@@ -1251,6 +1260,7 @@ class ttMLA:
             num_layers=self.layer_num,
             kv_actual_global=kv_actual_isl,
             cluster_axis=self.sp_axis,
+            tp_axis=self.tp_axis if self.tp_shard_kv else None,  # GLM-5.2 KV dedup: write only this chip's 1/tp window
         )
         # After the write above, KV is populated up to [0, kv_actual_isl + chunk_size_global); the gather
         # only needs that populated prefix (top-k indices never address the unwritten suffix).
@@ -1333,6 +1343,9 @@ class ttMLA:
 
         # Write the chunk via the SAME chunked path as _chunked_attn (not a single-shot fill):
         # update_padded_kv_cache writes at the per-chip offset derived from kv_actual_global.
+        # KV-only (last-layer migration fill) is not yet wired for TP-dedup — fail loud rather than
+        # silently write a TP-replicated cache when tp_shard_kv was requested.
+        assert not self.tp_shard_kv, "tp_shard_kv is not yet supported on the KV-only (_forward_kv_only) path"
         ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
             kvpe_cache,
             tt_kvpe,
@@ -1501,14 +1514,28 @@ class ttMLA:
         is NO read-back dtype/layout conversion."""
         cache_i = ttnn.to_memory_config(kvpe_cache, ttnn.DRAM_MEMORY_CONFIG)  # ND_SHARDED → INTERLEAVED
 
+        # GLM-5.2 KV dedup: when the cache is SP×TP-sharded, each device holds only 1/tp of its SP row's
+        # slab, so the per-device slab width is chunk_local/tp and reconstruction needs a TP-inner gather
+        # (concatenate a row's tp sub-shards) BEFORE the SP-outer gather. For a SINGLE block-cyclic slab
+        # that TP concat reproduces exactly the SP-only per-row slab, so the downstream sparse_sdpa remap
+        # (factor sp, chunk_local) is unchanged. Multi-slab would interleave wrong across slabs — gated below.
+        tp = self.tp_factor if self.tp_shard_kv else 1
+
         slot_lo = cache_batch_idx if cache_i.shape[0] > 1 else 0  # user-major slot select (single-slot → 0)
-        seq_hi = cache_i.shape[2]  # per-chip seq width to gather; default = full allocated cache
+        seq_hi = cache_i.shape[2]  # per-DEVICE seq width to gather; default = full allocated cache
         if populated_global is not None and chunk_local is not None:
             # Round the populated depth UP to whole block-cyclic slabs (see docstring): a partial boundary
             # slab is non-uniform across chips and fractional, so trim by slab count, not raw width.
             chunk_size_global = chunk_local * self.sp_factor
             num_slabs = -(-populated_global // chunk_size_global)  # ceil-div
-            seq_hi = min(num_slabs * chunk_local, seq_hi)
+            if self.tp_shard_kv and self.tp_factor > 1:
+                assert num_slabs == 1, (
+                    "tp_shard_kv read is only wired for single-chunk prefill (one block-cyclic slab); got "
+                    f"{num_slabs} slabs (populated_global={populated_global}, chunk_global={chunk_size_global}). "
+                    "Multi-chunk needs the sp*tp block-cyclic remap in sparse_sdpa (glm52_kv_cache_tp_sharding.md §6.1)."
+                )
+            cl_dev = chunk_local // tp  # per-DEVICE slab width (== chunk_local when not TP-sharded)
+            seq_hi = min(num_slabs * cl_dev, seq_hi)
 
         # Slice iff the cache is multi-slot (must select this slot even when it's slot 0) and/or the
         # populated-width trim applies. A single-slot cache (shape[0]==1) is already batch-1.
@@ -1520,7 +1547,14 @@ class ttMLA:
             )
             ttnn.deallocate(cache_i)
             cache_i = sel
-        full = self._all_gather(cache_i, dim=2, cluster_axis=self.sp_axis)  # → [1,1,seq_hi*sp,576] repl, block-cyclic
+        # TP-inner gather (reconstruct each SP row's full slab from its tp sub-shards), then SP-outer.
+        if self.tp_shard_kv and self.tp_factor > 1:
+            tp_full = self._all_gather(cache_i, dim=2, cluster_axis=self.tp_axis)  # → [1,1,seq_hi*tp,576] per SP row
+            ttnn.deallocate(cache_i)
+            cache_i = tp_full
+        full = self._all_gather(
+            cache_i, dim=2, cluster_axis=self.sp_axis
+        )  # → [1,1,chunk_global,576] repl, block-cyclic
         if self.sp_factor > 1:
             ttnn.deallocate(cache_i)
         return full

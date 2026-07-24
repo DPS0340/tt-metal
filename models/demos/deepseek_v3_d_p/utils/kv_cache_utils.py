@@ -386,6 +386,7 @@ def init_kvpe_cache(
     num_users=1,
     dtype=ttnn.bfloat8_b,
     layout=ttnn.TILE_LAYOUT,
+    tp_axis=None,
 ):
     """
     Initialize KVPE cache for MLA.
@@ -402,13 +403,20 @@ def init_kvpe_cache(
             so each user's layers stay contiguous.
         dtype: Cache element dtype (default bfloat8_b). Use fp8_e4m3 with ROW_MAJOR.
         layout: Cache layout (default TILE_LAYOUT). ROW_MAJOR required for fp8_e4m3.
+        tp_axis: GLM-5.2 KV dedup. When None (default) the cache is sharded on sequence across the SP
+            axis only and TP-replicated (per-device rows = seq_len / sp). When set, the cache is
+            ADDITIONALLY sharded across the TP axis (per-device rows = seq_len / (sp * tp)); the
+            block-cyclic content is written by update_padded_kv_cache(tp_axis=...) and read back with a
+            TP-inner + SP-outer all-gather. The physical container topology is unchanged (a replicate
+            container; the op defines the per-device layout) — only the per-device seq width shrinks.
 
     Returns:
         tt_kvpe_cache: Initialized KVPE cache on device
     """
     # hack in num_users * num_layers into batch size, so each user's layers are contiguous in memory
     num_layers = num_kvpe_cache_layers
-    seq_len_local = seq_len // mesh_shape[sp_axis]
+    tp_factor = mesh_shape[tp_axis] if tp_axis is not None else 1
+    seq_len_local = seq_len // (mesh_shape[sp_axis] * tp_factor)
 
     num_dram_banks = get_num_dram_banks(mesh_device)
     core_ranges = [
